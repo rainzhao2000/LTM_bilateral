@@ -1,0 +1,147 @@
+// LocalToneMap_Bilateral.dctl  (S-Log3 / S-Gamut3 in, S-Log3 / S-Gamut3 out)
+// Base/detail local tone mapping on CIE L* (Durand & Dorsey style).
+//   base   = bilateral(L*)
+//   detail = L* - base
+//   L*'    = anchor + (base - anchor) * contrast + detail * detailGain
+//
+// Place on a node that receives S-Log3 / S-Gamut3 directly (no CST needed).
+// Output is S-Log3 / S-Gamut3, so grading and your output transform continue as normal.
+// Internally: S-Log3 -> scene linear -> XYZ (D65) -> Lab. 18% grey -> L* ~ 49.5;
+// highlights above diffuse white simply give L* > 100.
+
+DEFINE_UI_PARAMS(radius,      Radius px,          DCTLUI_SLIDER_INT,   24,    1,     100,   1)
+DEFINE_UI_PARAMS(stepPx,      Sample step px,     DCTLUI_SLIDER_INT,   3,     1,     10,    1)
+DEFINE_UI_PARAMS(sigmaS,      Spatial sigma px,   DCTLUI_SLIDER_FLOAT, 12.0f, 0.5f,  50.0f, 0.1f)
+DEFINE_UI_PARAMS(sigmaR,      Range sigma L,     DCTLUI_SLIDER_FLOAT, 15.0f, 1.0f,  100.0f, 0.5f)
+DEFINE_UI_PARAMS(contrast,    Base contrast,        DCTLUI_SLIDER_FLOAT, 0.6f,  0.0f,  1.5f,  0.01f)
+DEFINE_UI_PARAMS(anchor,      Anchor L,            DCTLUI_SLIDER_FLOAT, 50.0f, 0.0f,  200.0f, 0.5f)
+DEFINE_UI_PARAMS(detailGain,  Detail gain,          DCTLUI_SLIDER_FLOAT, 1.0f,  0.0f,  3.0f,  0.01f)
+DEFINE_UI_PARAMS(chromaFollow,Chroma follows L,    DCTLUI_SLIDER_FLOAT, 1.0f,  0.0f,  1.0f,  0.01f)
+DEFINE_UI_PARAMS(scaleRes,    Scale radius to 1920, DCTLUI_CHECK_BOX,    1)
+DEFINE_UI_PARAMS(viewMode,    View,                 DCTLUI_COMBO_BOX,    0, { VIEW_RESULT, VIEW_BASE, VIEW_DETAIL }, { "Result", "Base grey", "Detail grey" })
+
+// White point = S-Gamut3 RGB(1,1,1) in XYZ (D65), so neutrals map exactly to a* = b* = 0
+#define XN 0.95045593f
+#define YN 1.0f
+#define ZN 1.08905775f
+
+// ---------- S-Log3 ----------
+__DEVICE__ float slog3ToLin(float x)
+{
+    return (x >= 171.2102946929f / 1023.0f)
+        ? _powf(10.0f, (x * 1023.0f - 420.0f) / 261.5f) * 0.19f - 0.01f
+        : (x * 1023.0f - 95.0f) * 0.01125f / (171.2102946929f - 95.0f);
+}
+
+__DEVICE__ float linToSlog3(float y)
+{
+    return (y >= 0.01125f)
+        ? (420.0f + _log10f((y + 0.01f) / 0.19f) * 261.5f) / 1023.0f
+        : (y * (171.2102946929f - 95.0f) / 0.01125f + 95.0f) / 1023.0f;
+}
+
+// ---------- Lab helpers ----------
+// The linear segment is used for all t below the knee, including negatives,
+// so out-of-gamut / sub-black values stay invertible instead of being clipped.
+__DEVICE__ float labF(float t)
+{
+    return (t > 0.008856f) ? _powf(t, 1.0f / 3.0f) : (7.787f * t + 16.0f / 116.0f);
+}
+
+__DEVICE__ float labFInv(float t)
+{
+    return (t > 0.206893f) ? (t * t * t) : ((t - 16.0f / 116.0f) / 7.787f);
+}
+
+// S-Gamut3 linear -> Y
+__DEVICE__ float lumY(float r, float g, float b)
+{
+    return 0.2709796708f * r + 0.7866064112f * g - 0.0575860820f * b;
+}
+
+// S-Log3 code values -> L*
+__DEVICE__ float lStarFromSlog3(float r, float g, float b)
+{
+    float Y = lumY(slog3ToLin(r), slog3ToLin(g), slog3ToLin(b));
+    return 116.0f * labF(Y / YN) - 16.0f;
+}
+
+__DEVICE__ float3 sgamut3ToLab(float3 c)
+{
+    float X =  0.7064827132f * c.x + 0.1288010498f * c.y + 0.1151721641f * c.z;
+    float Y =  0.2709796708f * c.x + 0.7866064112f * c.y - 0.0575860820f * c.z;
+    float Z = -0.0096778454f * c.x + 0.0046000375f * c.y + 1.0941355587f * c.z;
+    float fx = labF(X / XN);
+    float fy = labF(Y / YN);
+    float fz = labF(Z / ZN);
+    return make_float3(116.0f * fy - 16.0f, 500.0f * (fx - fy), 200.0f * (fy - fz));
+}
+
+__DEVICE__ float3 labToSgamut3(float3 lab)
+{
+    float fy = (lab.x + 16.0f) / 116.0f;
+    float fx = fy + lab.y / 500.0f;
+    float fz = fy - lab.z / 200.0f;
+    float X = XN * labFInv(fx);
+    float Y = YN * labFInv(fy);
+    float Z = ZN * labFInv(fz);
+    return make_float3( 1.5073998991f * X - 0.2458221374f * Y - 0.1716116808f * Z,
+                       -0.5181517271f * X + 1.3553912409f * Y + 0.1258786682f * Z,
+                        0.0155116982f * X - 0.0078727714f * Y + 0.9119163656f * Z);
+}
+
+__DEVICE__ float3 labToSlog3(float3 lab)
+{
+    float3 c = labToSgamut3(lab);
+    return make_float3(linToSlog3(c.x), linToSlog3(c.y), linToSlog3(c.z));
+}
+
+// ---------- main ----------
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, __TEXTURE__ p_TexR, __TEXTURE__ p_TexG, __TEXTURE__ p_TexB)
+{
+    float3 lin = make_float3(slog3ToLin(_tex2D(p_TexR, p_X, p_Y)),
+                             slog3ToLin(_tex2D(p_TexG, p_X, p_Y)),
+                             slog3ToLin(_tex2D(p_TexB, p_X, p_Y)));
+    float3 lab = sgamut3ToLab(lin);
+    float  L0  = lab.x;
+
+    // Keep the filter footprint the same fraction of frame width at any resolution
+    float  k    = scaleRes ? ((float)p_Width / 1920.0f) : 1.0f;
+    int    r    = (int)((float)radius * k + 0.5f);
+    int    st   = (int)((float)stepPx * k + 0.5f);
+    if (st < 1) st = 1;
+    float  sS   = sigmaS * k;
+    float  invS = 1.0f / (2.0f * sS * sS);
+    float  invR = 1.0f / (2.0f * sigmaR * sigmaR);
+
+    // Bilateral filter on L*
+    float sum = 0.0f, wsum = 0.0f;
+    for (int dy = -r; dy <= r; dy += st) {
+        int y = p_Y + dy;
+        y = (y < 0) ? 0 : ((y > p_Height - 1) ? p_Height - 1 : y);
+        for (int dx = -r; dx <= r; dx += st) {
+            int x = p_X + dx;
+            x = (x < 0) ? 0 : ((x > p_Width - 1) ? p_Width - 1 : x);
+            float Ln = lStarFromSlog3(_tex2D(p_TexR, x, y), _tex2D(p_TexG, x, y), _tex2D(p_TexB, x, y));
+            float d  = Ln - L0;
+            float w  = _expf(-(float)(dx * dx + dy * dy) * invS - d * d * invR);
+            sum  += Ln * w;
+            wsum += w;
+        }
+    }
+    float base   = sum / wsum;
+    float detail = L0 - base;
+
+    if (viewMode == VIEW_BASE)   return labToSlog3(make_float3(base, 0.0f, 0.0f));
+    if (viewMode == VIEW_DETAIL) return labToSlog3(make_float3(50.0f + detail, 0.0f, 0.0f));
+
+    // Compress base around a fixed anchor (no frame-wide max/min available in DCTL)
+    float baseC = anchor + (base - anchor) * contrast;
+    float L1    = baseC + detail * detailGain;
+
+    // Optionally scale a*, b* with the lightness change to keep chroma/lightness ratio
+    float ratio = (L0 > 0.01f && L1 > 0.0f) ? (L1 / L0) : 1.0f;
+    float cs    = _powf(ratio, chromaFollow);
+
+    return labToSlog3(make_float3(L1, lab.y * cs, lab.z * cs));
+}

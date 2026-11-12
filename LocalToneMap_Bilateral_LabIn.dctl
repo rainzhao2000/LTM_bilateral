@@ -1,0 +1,91 @@
+// LocalToneMap_Bilateral_LabIn.dctl  (CIE Lab in, CIE Lab out)
+// Base/detail local tone mapping on L (Durand & Dorsey style).
+//   base   = bilateral(L)
+//   detail = L - base
+//   L'     = anchor + (base - anchor) * contrast + detail * detailGain
+//
+// INPUT:  R = L*, G = a*, B = b*  (already converted upstream)
+// OUTPUT: same Lab encoding; convert back to RGB downstream.
+//
+// "Channel units" lets you match how the Lab values are stored:
+//   L* 0-100   : native CIE units (L* 0..100+, a*/b* signed, roughly -128..127)
+//   L* 0-1     : all three channels divided by 100 (L 0..1, a/b roughly -1.28..1.27)
+// All sliders below are always in native L* units; scaling is handled internally.
+
+DEFINE_UI_PARAMS(radius,      Radius px,          DCTLUI_SLIDER_INT,   24,    1,     100,   1)
+DEFINE_UI_PARAMS(stepPx,      Sample step px,     DCTLUI_SLIDER_INT,   3,     1,     10,    1)
+DEFINE_UI_PARAMS(sigmaS,      Spatial sigma px,   DCTLUI_SLIDER_FLOAT, 12.0f, 0.5f,  50.0f, 0.1f)
+DEFINE_UI_PARAMS(sigmaR,      Range sigma L,     DCTLUI_SLIDER_FLOAT, 15.0f, 1.0f,  100.0f, 0.5f)
+DEFINE_UI_PARAMS(contrast,    Base contrast,        DCTLUI_SLIDER_FLOAT, 0.6f,  0.0f,  1.5f,  0.01f)
+DEFINE_UI_PARAMS(anchor,      Anchor L,            DCTLUI_SLIDER_FLOAT, 50.0f, 0.0f,  200.0f, 0.5f)
+DEFINE_UI_PARAMS(detailGain,  Detail gain,          DCTLUI_SLIDER_FLOAT, 1.0f,  0.0f,  3.0f,  0.01f)
+DEFINE_UI_PARAMS(chromaFollow,Chroma follows L,    DCTLUI_SLIDER_FLOAT, 0.5f,  0.0f,  1.0f,  0.01f)
+DEFINE_UI_PARAMS(chromaMax,   Chroma boost limit,   DCTLUI_SLIDER_FLOAT, 1.25f, 1.0f,  3.0f,  0.01f)
+DEFINE_UI_PARAMS(neutralA,    Neutral a,            DCTLUI_SLIDER_FLOAT, 0.5f,  -1.0f, 1.0f,  0.001f)
+DEFINE_UI_PARAMS(neutralB,    Neutral b,            DCTLUI_SLIDER_FLOAT, 0.5f,  -1.0f, 1.0f,  0.001f)
+DEFINE_UI_PARAMS(scaleRes,    Scale radius to 1920, DCTLUI_CHECK_BOX,    1)
+DEFINE_UI_PARAMS(units,       Channel units,        DCTLUI_COMBO_BOX,    1, { UNITS_100, UNITS_1 }, { "L 0 to 100", "L 0 to 1" })
+DEFINE_UI_PARAMS(viewMode,    View,                 DCTLUI_COMBO_BOX,    0, { VIEW_RESULT, VIEW_BASE, VIEW_DETAIL, VIEW_PROBE }, { "Result", "Base grey", "Detail grey", "Probe ab" })
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, __TEXTURE__ p_TexR, __TEXTURE__ p_TexG, __TEXTURE__ p_TexB)
+{
+    // Convert stored values to native L* units
+    float toNative   = (units == UNITS_1) ? 100.0f : 1.0f;
+    float fromNative = 1.0f / toNative;
+
+    float L0 = _tex2D(p_TexR, p_X, p_Y) * toNative;
+    // a/b measured relative to the neutral point (in stored units), so chroma
+    // scaling never scales an offset or white-point tint
+    float a0 = (_tex2D(p_TexG, p_X, p_Y) - neutralA) * toNative;
+    float b0 = (_tex2D(p_TexB, p_X, p_Y) - neutralB) * toNative;
+
+    // Keep the filter footprint the same fraction of frame width at any resolution
+    float  k    = scaleRes ? ((float)p_Width / 1920.0f) : 1.0f;
+    int    r    = (int)((float)radius * k + 0.5f);
+    int    st   = (int)((float)stepPx * k + 0.5f);
+    if (st < 1) st = 1;
+    float  sS   = sigmaS * k;
+    float  invS = 1.0f / (2.0f * sS * sS);
+    float  invR = 1.0f / (2.0f * sigmaR * sigmaR);
+
+    // Bilateral filter on L (one texture read per tap)
+    float sum = 0.0f, wsum = 0.0f;
+    for (int dy = -r; dy <= r; dy += st) {
+        int y = p_Y + dy;
+        y = (y < 0) ? 0 : ((y > p_Height - 1) ? p_Height - 1 : y);
+        for (int dx = -r; dx <= r; dx += st) {
+            int x = p_X + dx;
+            x = (x < 0) ? 0 : ((x > p_Width - 1) ? p_Width - 1 : x);
+            float Ln = _tex2D(p_TexR, x, y) * toNative;
+            float d  = Ln - L0;
+            float w  = _expf(-(float)(dx * dx + dy * dy) * invS - d * d * invR);
+            sum  += Ln * w;
+            wsum += w;
+        }
+    }
+    float base   = sum / wsum;
+    float detail = L0 - base;
+
+    if (viewMode == VIEW_PROBE) {
+        // Neutral areas turn mid grey when Neutral a and b are set correctly;
+        // any residual tint is shown greatly exaggerated.
+        return make_float3(50.0f * fromNative, a0 * 10.0f * fromNative + neutralA, b0 * 10.0f * fromNative + neutralB);
+    }
+    if (viewMode == VIEW_BASE)
+        return make_float3(base * fromNative, neutralA, neutralB);
+    if (viewMode == VIEW_DETAIL)
+        return make_float3((50.0f + detail) * fromNative, neutralA, neutralB);
+
+    // Compress base around a fixed anchor (no frame-wide max/min available in DCTL)
+    float baseC = anchor + (base - anchor) * contrast;
+    float L1    = baseC + detail * detailGain;
+
+    // Optionally scale a*, b* with the lightness change to keep chroma/lightness ratio
+    // Offset of 10 L* stops near-black pixels producing huge ratios;
+    // the boost limit caps chroma gain so lifted shadows stay in gamut.
+    float ratio = (_fmaxf(L1, 0.0f) + 10.0f) / (_fmaxf(L0, 0.0f) + 10.0f);
+    float cs    = _powf(ratio, chromaFollow);
+    cs = _fminf(cs, chromaMax);
+
+    return make_float3(L1 * fromNative, a0 * cs * fromNative + neutralA, b0 * cs * fromNative + neutralB);
+}
