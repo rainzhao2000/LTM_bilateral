@@ -32,14 +32,17 @@ local texture and contrast.
 1. Copy the `.dctl` file into Resolve's LUT folder
    (Windows: `C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\LUT\`).
    Project Settings → Color Management → Lookup Tables → **Open LUT Folder** also gets you there.
-2. Click **Update Lists** in the same panel, or restart Resolve.
+2. **Restart Resolve.** A new DCTL file isn't reliably loaded until Resolve restarts;
+   **Update Lists** alone may not make it appear or load properly.
 3. Color page → Effects → ResolveFX Color → **DCTL**. Drag it onto a node and choose the file
    from **DCTL List**.
 
 Don't apply it as a LUT (right-click node → LUT). That route has no sliders, and the filter
 must read neighbouring pixels, which only works through the DCTL effect.
 
-After editing the file, choose it again from the DCTL List (or Update Lists) to recompile.
+After editing a file that is already loaded, choose it again from the DCTL List (or click
+Update Lists) to recompile. If the changes don't show up, or you added a new or renamed
+`.dctl` file, restart Resolve.
 Build errors are written to
 `%APPDATA%\Blackmagic Design\DaVinci Resolve\Support\logs\ResolveDebug.txt`.
 
