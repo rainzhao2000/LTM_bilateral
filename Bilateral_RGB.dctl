@@ -1,0 +1,64 @@
+// Bilateral_RGB.dctl
+// Applies an independent bilateral filter to each channel (R, G, B).
+// Each channel's range weights use only that channel's own differences.
+//
+// Channel scale converts stored values to working units before filtering
+// (toNative) and back afterwards (fromNative = 1 / scale), like the
+// Channel units menu in LocalToneMap_Bilateral_LabIn.dctl but with any factor.
+// Default 100: 0..1 data is filtered as 0..100.
+// Range sigma is in the scaled (working) units.
+
+DEFINE_UI_PARAMS(radius,   Radius px,            DCTLUI_SLIDER_INT,   24,     1,     100,    1)
+DEFINE_UI_PARAMS(stepPx,   Sample step px,       DCTLUI_SLIDER_INT,   3,      1,     10,     1)
+DEFINE_UI_PARAMS(sigmaS,   Spatial sigma px,     DCTLUI_SLIDER_FLOAT, 12.0f,  0.5f,  50.0f,  0.1f)
+DEFINE_UI_PARAMS(sigmaR,   Range sigma,          DCTLUI_SLIDER_FLOAT, 15.0f,  0.5f,  100.0f, 0.5f)
+DEFINE_UI_PARAMS(chScale,  Channel scale,        DCTLUI_SLIDER_FLOAT, 100.0f, 0.01f, 1000.0f, 0.01f)
+DEFINE_UI_PARAMS(scaleRes, Scale radius to 1920, DCTLUI_CHECK_BOX,    1)
+
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, __TEXTURE__ p_TexR, __TEXTURE__ p_TexG, __TEXTURE__ p_TexB)
+{
+    // Convert stored values to working units
+    float toNative   = _fmaxf(chScale, 1e-6f);
+    float fromNative = 1.0f / toNative;
+
+    float R0 = _tex2D(p_TexR, p_X, p_Y) * toNative;
+    float G0 = _tex2D(p_TexG, p_X, p_Y) * toNative;
+    float B0 = _tex2D(p_TexB, p_X, p_Y) * toNative;
+
+    // Keep the filter footprint the same fraction of frame width at any resolution
+    float k    = scaleRes ? ((float)p_Width / 1920.0f) : 1.0f;
+    int   r    = (int)((float)radius * k + 0.5f);
+    int   st   = (int)((float)stepPx * k + 0.5f);
+    if (st < 1) st = 1;
+    float sS   = sigmaS * k;
+    float invS = 1.0f / (2.0f * sS * sS);
+    float invR = 1.0f / (2.0f * sigmaR * sigmaR);
+
+    float sumR = 0.0f, wsumR = 0.0f;
+    float sumG = 0.0f, wsumG = 0.0f;
+    float sumB = 0.0f, wsumB = 0.0f;
+    for (int dy = -r; dy <= r; dy += st) {
+        int y = p_Y + dy;
+        y = (y < 0) ? 0 : ((y > p_Height - 1) ? p_Height - 1 : y);
+        for (int dx = -r; dx <= r; dx += st) {
+            int x = p_X + dx;
+            x = (x < 0) ? 0 : ((x > p_Width - 1) ? p_Width - 1 : x);
+            float ws = -(float)(dx * dx + dy * dy) * invS;
+
+            float Rn = _tex2D(p_TexR, x, y) * toNative;
+            float Gn = _tex2D(p_TexG, x, y) * toNative;
+            float Bn = _tex2D(p_TexB, x, y) * toNative;
+            float dR = Rn - R0, dG = Gn - G0, dB = Bn - B0;
+
+            float wR = _expf(ws - dR * dR * invR);
+            float wG = _expf(ws - dG * dG * invR);
+            float wB = _expf(ws - dB * dB * invR);
+
+            sumR += Rn * wR;  wsumR += wR;
+            sumG += Gn * wG;  wsumG += wG;
+            sumB += Bn * wB;  wsumB += wB;
+        }
+    }
+
+    return make_float3(sumR / wsumR * fromNative, sumG / wsumG * fromNative, sumB / wsumB * fromNative);
+}

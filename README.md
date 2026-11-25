@@ -19,6 +19,7 @@ local texture and contrast.
 |---|---|---|
 | `LocalToneMap_Bilateral_LabIn.dctl` | **Main, tested in Resolve** | Lab in, Lab out (R = L, G = a, B = b) |
 | `experimental/LocalToneMap_Bilateral_SLog3.dctl` | Not tested in Resolve | S-Log3 / S-Gamut3 in and out; does its own Lab conversion |
+| `Bilateral_RGB.dctl` | Not tested in Resolve | Any RGB; independent bilateral filter on each channel |
 | `docs/DEVELOPMENT_NOTES.md` | | Build errors, Lab encoding findings, hue-shift debugging, ideas |
 
 ## Requirements
